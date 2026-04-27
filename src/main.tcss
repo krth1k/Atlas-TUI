@@ -1,0 +1,48 @@
+Tabs {
+    layout: horizontal;
+    background: $boost;
+    height: 5;
+    padding: 1;
+    margin: 1;
+    min-width: 50;
+}
+
+Button {
+    width: 15;
+    margin: 0 2;
+}
+
+TimeClock {
+    height: 3;
+    color: $foreground-darken-3;
+    text-align: center;
+}
+
+#start {
+    dock: left;
+}
+
+#stop {
+    dock: left;
+    display: none;
+}
+
+.started #start {
+    display: none;
+}
+
+.started #stop {
+    display: block;
+}
+
+#reset {
+    dock: right;
+}
+
+.started #reset {
+    display: none;
+}
+
+.hidden {
+    display: none;
+}

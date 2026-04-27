@@ -1,0 +1,317 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: krth1k/atlas-tui
+  IAC_REPO: krth1k/krth1k-IaC
+  HELM_VALUES_PATH: helm/atlas-tui/values.yaml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Lint
+  # ---------------------------------------------------------------------------
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - run: uv sync --frozen
+
+      - run: uv run ruff check src/
+
+      - run: uv run ruff format --check src/
+
+  # ---------------------------------------------------------------------------
+  # SAST: Bandit + Semgrep + Gitleaks + pip-audit
+  # ---------------------------------------------------------------------------
+  sast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Bandit (Python security linter)
+        run: |
+          uvx bandit -r src/ -ll -f sarif -o bandit.sarif
+
+      - name: Upload Bandit SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: bandit.sarif
+          category: bandit
+
+      - name: Semgrep (rule-based SAST)
+        run: |
+          uvx semgrep@latest scan \
+            --config=p/security-audit \
+            --config=p/python \
+            --config=p/dockerfile \
+            --config=p/owasp-top-ten \
+            --sarif --output=semgrep.sarif \
+            --error
+        continue-on-error: false
+
+      - name: Upload Semgrep SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+      - name: Gitleaks (secret scanning)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: pip-audit (dependency vulnerabilities)
+        run: |
+          uv export --no-dev --no-hashes -o reqs.txt
+          uvx pip-audit -r reqs.txt --strict
+
+  # ---------------------------------------------------------------------------
+  # CodeQL: deep semantic analysis (Python). Gates build.
+  # Scheduled weekly run is in codeql.yml.
+  # ---------------------------------------------------------------------------
+  codeql:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: python
+          queries: security-and-quality
+
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:python"
+
+  # ---------------------------------------------------------------------------
+  # Build: multi-arch (amd64+arm64) OCI tarball, no push yet
+  # ---------------------------------------------------------------------------
+  build:
+    needs: [lint, sast, codeql]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build OCI tarball
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          outputs: type=oci,dest=/tmp/image.tar
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      - name: Upload OCI tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-tarball
+          path: /tmp/image.tar
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Image scan: Trivy on built tarball, fail on CRITICAL/HIGH
+  # ---------------------------------------------------------------------------
+  image-scan:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: image-tarball
+          path: /tmp
+
+      - name: Trivy scan (SARIF for Security tab)
+        uses: aquasecurity/trivy-action@0.29.0
+        with:
+          input: /tmp/image.tar
+          format: sarif
+          output: trivy.sarif
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+
+      - name: Upload Trivy SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
+          category: trivy
+
+      - name: Trivy scan (gating, fail on CRITICAL/HIGH)
+        uses: aquasecurity/trivy-action@0.29.0
+        with:
+          input: /tmp/image.tar
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: 1
+          ignore-unfixed: true
+
+  # ---------------------------------------------------------------------------
+  # Publish: push to GHCR, cosign sign, SBOM attest
+  # ---------------------------------------------------------------------------
+  publish:
+    needs: image-scan
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+      tag: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,format=long
+            type=ref,event=branch
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Cosign keyless sign (OIDC)
+        env:
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+        run: cosign sign --yes "$IMAGE_REF"
+
+      - uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+
+      - name: Cosign attest SBOM
+        env:
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+        run: |
+          cosign attest --yes \
+            --predicate sbom.spdx.json \
+            --type spdx \
+            "$IMAGE_REF"
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-spdx
+          path: sbom.spdx.json
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # GitOps bump: update image tag/digest in IaC Helm values, commit, push
+  # ---------------------------------------------------------------------------
+  gitops-bump:
+    needs: publish
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout IaC repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.IAC_REPO }}
+          token: ${{ secrets.IAC_REPO_TOKEN }}
+          path: iac
+
+      - name: Bump image tag and digest in Helm values
+        uses: mikefarah/yq@v4
+        with:
+          cmd: |
+            yq -i '
+              .image.tag = "${{ needs.publish.outputs.tag }}" |
+              .image.digest = "${{ needs.publish.outputs.digest }}"
+            ' iac/${{ env.HELM_VALUES_PATH }}
+
+      - name: Commit and push
+        working-directory: iac
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ${{ env.HELM_VALUES_PATH }}
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m "chore(atlas-tui): bump image to ${SHA}"
+          git push
