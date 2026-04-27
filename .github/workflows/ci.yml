@@ -60,7 +60,7 @@ jobs:
 
       - name: Bandit (Python security linter)
         run: |
-          uvx bandit -r src/ -ll -f sarif -o bandit.sarif
+          uvx --with bandit-sarif-formatter bandit -r src/ -ll -f sarif -o bandit.sarif
 
       - name: Upload Bandit SARIF
         if: always()
